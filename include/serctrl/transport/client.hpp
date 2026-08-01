@@ -95,6 +95,14 @@ public:
     bool authenticate(const std::string& user, const std::string& token);
 
     /**
+     * @brief 启用加密
+     * @param token 认证令牌（用于派生会话密钥）
+     *
+     * 认证成功后调用，从 token 派生 Encryptor 密钥。
+     */
+    void enableEncryption(const std::string& token);
+
+    /**
      * @brief 注册连接成功回调
      * @param handler 连接建立时调用
      */

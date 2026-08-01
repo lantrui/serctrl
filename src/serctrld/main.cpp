@@ -27,11 +27,13 @@
 #include <unordered_map>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <chrono>
 #include <array>
 #include <cstdio>
 
 static void printBanner() {
-    std::cout << "SerCTRL v0.1.0" << std::endl;
+    std::cout << "SerCTRL v0.1.1" << std::endl;
     std::cout << "Encrypted Remote Shell Daemon" << std::endl << std::endl;
 }
 
@@ -157,15 +159,22 @@ static void cmdStart(const std::vector<std::string>& args) {
 
     serctrl::transport::Server server(config);
 
+    // 会话管理（ShellOpen/ShellData/ShellClose 共享）
+    struct ShellSession {
+        std::unique_ptr<serctrl::shell::Session> session;
+        std::unique_ptr<std::thread> readerThread;
+        std::string clientId;
+    };
+    std::unordered_map<std::string, std::shared_ptr<ShellSession>> sessions;
+    std::mutex sessionsLock;
+
     // 注册客户端消息处理器
-    server.setClientHandler([&server](const std::string& clientId, const serctrl::protocol::Message& msg) {
+    server.setClientHandler([&server, &sessions, &sessionsLock](const std::string& clientId, const serctrl::protocol::Message& msg) {
         switch (msg.type) {
             case serctrl::protocol::MsgType::Exec: {
                 // 执行远程命令
                 auto* execPayload = std::get_if<serctrl::protocol::ExecPayload>(&msg.payload);
-                if (!execPayload) {
-                    break;
-                }
+                if (!execPayload) break;
 
                 auto [exitCode, stdoutStr, stderrStr] = runCommand(execPayload->command);
 
@@ -179,11 +188,93 @@ static void cmdStart(const std::vector<std::string>& args) {
             }
 
             case serctrl::protocol::MsgType::ShellOpen: {
-                // TODO: 创建 PTY 会话
+                auto* openPayload = std::get_if<serctrl::protocol::ShellOpenPayload>(&msg.payload);
+                if (!openPayload) break;
+
+                std::string sid = std::to_string(
+                    std::chrono::steady_clock::now().time_since_epoch().count());
+
+                auto ss = std::make_shared<ShellSession>();
+                ss->session = std::make_unique<serctrl::shell::Session>(sid,
+                    serctrl::shell::PtyOptions{openPayload->cols, openPayload->rows});
+                ss->clientId = clientId;
+
+                if (!ss->session->isRunning()) {
+                    serctrl::protocol::Message resp;
+                    resp.type = serctrl::protocol::MsgType::ShellOpenResult;
+                    resp.payload = serctrl::protocol::ShellOpenResultPayload{openPayload->requestId, "", false};
+                    server.sendToClient(clientId, resp);
+                    break;
+                }
+
+                // PTY 读取线程
+                ss->readerThread = std::make_unique<std::thread>([ss, sid, &server]() {
+                    char buf[4096];
+                    while (ss->session->isRunning()) {
+                        auto n = ss->session->readPTY(buf, sizeof(buf));
+                        if (n > 0) {
+                            serctrl::protocol::Message resp;
+                            resp.type = serctrl::protocol::MsgType::ShellData;
+                            resp.payload = serctrl::protocol::ShellDataPayload{sid, std::string(buf, (size_t)n)};
+                            server.sendToClient(ss->clientId, resp);
+                        } else if (n < 0) {
+                            break;
+                        }
+                        usleep(10000);
+                    }
+                });
+
+                {
+                    std::lock_guard<std::mutex> lock(sessionsLock);
+                    sessions[sid] = ss;
+                }
+
                 serctrl::protocol::Message resp;
-                resp.type = serctrl::protocol::MsgType::Error;
-                resp.payload = serctrl::protocol::ErrorPayload{"Shell not yet implemented"};
+                resp.type = serctrl::protocol::MsgType::ShellOpenResult;
+                resp.payload = serctrl::protocol::ShellOpenResultPayload{openPayload->requestId, sid, true};
                 server.sendToClient(clientId, resp);
+                LOG_INFO("Shell opened: %s", sid.c_str());
+                break;
+            }
+
+            case serctrl::protocol::MsgType::ShellData: {
+                auto* dp = std::get_if<serctrl::protocol::ShellDataPayload>(&msg.payload);
+                if (!dp) break;
+                std::shared_ptr<ShellSession> ss;
+                {
+                    std::lock_guard<std::mutex> lock(sessionsLock);
+                    auto it = sessions.find(dp->sessionId);
+                    if (it == sessions.end()) break;
+                    ss = it->second;
+                }
+                ss->session->write(dp->data);
+                break;
+            }
+
+            case serctrl::protocol::MsgType::ShellResize: {
+                auto* rp = std::get_if<serctrl::protocol::ShellResizePayload>(&msg.payload);
+                if (!rp) break;
+                std::lock_guard<std::mutex> lock(sessionsLock);
+                auto it = sessions.find(rp->sessionId);
+                if (it != sessions.end()) {
+                    it->second->session->resize(rp->cols, rp->rows);
+                }
+                break;
+            }
+
+            case serctrl::protocol::MsgType::ShellClose: {
+                auto* cp = std::get_if<serctrl::protocol::ShellClosePayload>(&msg.payload);
+                if (!cp) break;
+                std::lock_guard<std::mutex> lock(sessionsLock);
+                auto it = sessions.find(cp->sessionId);
+                if (it != sessions.end()) {
+                    it->second->session->close();
+                    if (it->second->readerThread && it->second->readerThread->joinable()) {
+                        it->second->readerThread->join();
+                    }
+                    sessions.erase(it);
+                    LOG_INFO("Shell closed: %s", cp->sessionId.c_str());
+                }
                 break;
             }
 

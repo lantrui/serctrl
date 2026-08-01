@@ -4,6 +4,7 @@ set(TEST_SOURCES
     test_encryptor.cpp
     test_auth.cpp
     test_config.cpp
+    test_e2e.cpp
 )
 
 add_executable(serctrl_tests ${TEST_SOURCES})

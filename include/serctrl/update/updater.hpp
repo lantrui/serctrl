@@ -46,7 +46,7 @@ struct ReleaseVersion {
  *
  * 用法：
  * @code
- *   Updater updater("zt8h7cwrrc-coder", "serctrl");
+ *   Updater updater("lantrui", "serctrl");
  *   updater.updateTo("1.2.0");  // 更新到指定版本
  *   updater.rollback();          // 回滚
  * @endcode

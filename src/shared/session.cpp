@@ -51,6 +51,13 @@ bool Session::resize(uint32_t cols, uint32_t rows) {
     return pty_->resize(cols, rows);
 }
 
+ssize_t Session::readPTY(char* buf, size_t len) {
+    if (!running_ || !pty_) {
+        return -1;
+    }
+    return pty_->readData(std::span<uint8_t>(reinterpret_cast<uint8_t*>(buf), len));
+}
+
 void Session::close() {
     running_ = false;
     if (pty_) {

@@ -31,7 +31,7 @@
 #include <signal.h>
 
 static void printBanner() {
-    std::cout << "SerCTRL v0.1.0" << std::endl;
+    std::cout << "SerCTRL v0.1.1" << std::endl;
     std::cout << "Encrypted Remote Shell" << std::endl << std::endl;
 }
 
@@ -116,7 +116,7 @@ static void cmdKeygen() {
 }
 
 static void cmdUpdate(const std::vector<std::string>& args) {
-    serctrl::update::Updater updater("zt8h7cwrrc-coder", "serctrl");
+    serctrl::update::Updater updater("lantrui", "serctrl");
 
     std::string version;
     for (size_t i = 1; i < args.size(); ++i) {
@@ -138,7 +138,7 @@ static void cmdUpdate(const std::vector<std::string>& args) {
 }
 
 static void cmdRollback() {
-    serctrl::update::Updater updater("zt8h7cwrrc-coder", "serctrl");
+    serctrl::update::Updater updater("lantrui", "serctrl");
     if (updater.rollback()) {
         std::cout << "Rollback successful!" << std::endl;
     } else {
@@ -201,6 +201,10 @@ static int cmdConnect(const std::string& target,
             if (result) {
                 authOk = result->ok;
                 authError = result->error;
+                // 认证成功后启用加密
+                if (result->ok && !clientConfig.token.empty()) {
+                    client.enableEncryption(clientConfig.token);
+                }
             }
         } else if (msg.type == serctrl::protocol::MsgType::ExecResult) {
             auto* result = std::get_if<serctrl::protocol::ExecResultPayload>(&msg.payload);

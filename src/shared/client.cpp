@@ -19,6 +19,8 @@
 
 #include "serctrl/transport/client.hpp"
 #include "serctrl/protocol/codec.hpp"
+#include "serctrl/crypto/encryptor.hpp"
+#include "serctrl/auth/authenticator.hpp"
 #include "serctrl/util/logger.hpp"
 
 #include <ixwebsocket/IXWebSocket.h>
@@ -61,20 +63,31 @@ bool Client::connect(const ClientConfig& config) {
             case ix::WebSocketMessageType::Open:
                 LOG_INFO("Connected to %s:%d", config_.host.c_str(), config_.port);
                 connected_ = true;
-                state_->currentDelay = config_.reconnectDelay; // 重置重连延迟
+                state_->currentDelay = config_.reconnectDelay;
                 if (onConnect_) {
                     onConnect_();
                 }
-                // 自动发送认证
                 if (!config_.user.empty() && !config_.token.empty()) {
                     authenticate(config_.user, config_.token);
                 }
                 break;
 
             case ix::WebSocketMessageType::Message: {
-                auto data = std::span<const uint8_t>(
+                auto raw = std::span<const uint8_t>(
                     reinterpret_cast<const uint8_t*>(msg->str.data()), msg->str.size());
-                handleMessage(data);
+
+                // 加密消息：先解密再解码
+                auto* binMsg = dynamic_cast<const ix::WebSocketMessage*>(msg.get());
+                if (encryptor_ && msg->binary) {
+                    try {
+                        auto plaintext = encryptor_->decrypt(raw);
+                        handleMessage(plaintext);
+                    } catch (...) {
+                        LOG_ERROR("Decryption failed");
+                    }
+                } else {
+                    handleMessage(raw);
+                }
                 break;
             }
 
@@ -86,7 +99,6 @@ bool Client::connect(const ClientConfig& config) {
                 if (onDisconnect_) {
                     onDisconnect_();
                 }
-                // 触发自动重连
                 if (s.shouldReconnect && !s.stopping) {
                     startReconnect();
                 }
@@ -140,10 +152,17 @@ bool Client::send(const protocol::Message& msg) {
     }
 
     auto encoded = protocol::encode(msg);
-    auto result = s.ws->sendText(
-        std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
 
-    return result.success;
+    if (encryptor_) {
+        auto ciphertext = encryptor_->encrypt(encoded);
+        return s.ws->sendBinary(
+            std::string(reinterpret_cast<const char*>(ciphertext.data()), ciphertext.size())
+        ).success;
+    }
+
+    return s.ws->sendText(
+        std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size())
+    ).success;
 }
 
 bool Client::isConnected() const {
@@ -163,6 +182,16 @@ bool Client::authenticate(const std::string& user, const std::string& token) {
     msg.payload = protocol::AuthPayload{user, token};
 
     return send(msg);
+}
+
+void Client::enableEncryption(const std::string& token) {
+    // 用令牌指纹派生32字节会话密钥
+    auto fp = auth::Authenticator::computeFingerprint(
+        auth::Authenticator::hexToToken(token));
+    serctrl::crypto::Key sessionKey;
+    std::copy(fp.begin(), fp.end(), sessionKey.begin());
+    encryptor_ = std::make_unique<serctrl::crypto::Encryptor>(sessionKey);
+    LOG_INFO("Encryption enabled");
 }
 
 void Client::onConnect(std::function<void()> handler) {

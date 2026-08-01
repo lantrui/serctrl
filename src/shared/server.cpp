@@ -34,9 +34,10 @@ namespace serctrl::transport {
 
 /** @brief 每个 WebSocket 连接的数据 */
 struct PerSocketData {
-    std::string clientId;       ///< 客户端唯一ID
-    bool authenticated = false; ///< 是否已认证
-    std::string user;           ///< 认证用户名
+    std::string clientId;                                   ///< 客户端唯一ID
+    bool authenticated = false;                             ///< 是否已认证
+    std::string user;                                       ///< 认证用户名
+    std::unique_ptr<crypto::Encryptor> encryptor;            ///< 加密器（认证后启用）
 };
 
 /** @brief 服务器内部状态 */
@@ -95,17 +96,27 @@ void Server::start() {
 
                 // 收到消息
                 .message = [this, &s](auto* ws, std::string_view message, uWS::OpCode opCode) {
-                    if (opCode != uWS::OpCode::TEXT) {
-                        return;  // 仅处理文本消息
+                    if (opCode != uWS::OpCode::TEXT && opCode != uWS::OpCode::BINARY) {
+                        return;
                     }
 
                     auto* data = ws->getUserData();
-
-                    // 解码消息
-                    auto msgData = std::span<const uint8_t>(
+                    auto raw = std::span<const uint8_t>(
                         reinterpret_cast<const uint8_t*>(message.data()), message.size());
-                    auto msg = protocol::decode(msgData);
 
+                    // 如果是二进制消息 + 认证后 = 加密消息，先解密
+                    std::vector<uint8_t> decryptedBuf;
+                    if (opCode == uWS::OpCode::BINARY && data->encryptor) {
+                        try {
+                            decryptedBuf = data->encryptor->decrypt(raw);
+                            raw = decryptedBuf;
+                        } catch (...) {
+                            LOG_WARN("Decryption failed from %s", data->clientId.c_str());
+                            return;
+                        }
+                    }
+
+                    auto msg = protocol::decode(raw);
                     if (!msg) {
                         LOG_WARN("Failed to decode message from %s", data->clientId.c_str());
                         return;
@@ -115,7 +126,6 @@ void Server::start() {
                     if (!data->authenticated &&
                         msg->type != protocol::MsgType::Auth &&
                         msg->type != protocol::MsgType::Ping) {
-                        // 发送认证失败响应
                         protocol::Message resp;
                         resp.type = protocol::MsgType::AuthResult;
                         resp.payload = protocol::AuthResultPayload{false, "Authentication required"};
@@ -133,6 +143,15 @@ void Server::start() {
                             data->authenticated = ok;
                             data->user = authPayload->user;
 
+                            // 认证成功后派生会话密钥
+                            if (ok) {
+                                auth::Fingerprint fp = auth::Authenticator::computeFingerprint(
+                                    auth::Authenticator::hexToToken(authPayload->token));
+                                crypto::Key sessionKey;
+                                std::copy(fp.begin(), fp.end(), sessionKey.begin());
+                                data->encryptor = std::make_unique<crypto::Encryptor>(sessionKey);
+                            }
+
                             protocol::Message resp;
                             resp.type = protocol::MsgType::AuthResult;
                             resp.payload = protocol::AuthResultPayload{ok, ok ? "" : "Invalid credentials"};
@@ -140,22 +159,27 @@ void Server::start() {
                             ws->send(std::string_view(reinterpret_cast<const char*>(encoded.data()), encoded.size()),
                                      uWS::OpCode::TEXT);
 
-                            LOG_INFO("Client %s: auth %s (user=%s)",
-                                     data->clientId.c_str(),
-                                     ok ? "ok" : "failed",
-                                     authPayload->user.c_str());
+                            LOG_INFO("Client %s: auth %s (user=%s%s)", data->clientId.c_str(),
+                                     ok ? "ok" : "failed", authPayload->user.c_str(),
+                                     ok ? ", encrypted" : "");
                         }
                         return;
                     }
 
-                    // 处理心跳
+                    // 处理心跳（加密后仍允许明文 ping）
                     if (msg->type == protocol::MsgType::Ping) {
                         protocol::Message resp;
                         resp.type = protocol::MsgType::Pong;
                         resp.payload = protocol::PongPayload{};
                         auto encoded = protocol::encode(resp);
-                        ws->send(std::string_view(reinterpret_cast<const char*>(encoded.data()), encoded.size()),
-                                 uWS::OpCode::TEXT);
+                        auto sv = std::string_view(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+                        if (data->encryptor) {
+                            auto ct = data->encryptor->encrypt(encoded);
+                            ws->send(std::string_view(reinterpret_cast<const char*>(ct.data()), ct.size()),
+                                     uWS::OpCode::BINARY);
+                        } else {
+                            ws->send(sv, uWS::OpCode::TEXT);
+                        }
                         return;
                     }
 
@@ -226,9 +250,20 @@ bool Server::sendToClient(const std::string& clientId, const protocol::Message& 
     }
 
     auto encoded = protocol::encode(msg);
-    auto status = it->second->send(
-        std::string_view(reinterpret_cast<const char*>(encoded.data()), encoded.size()),
-        uWS::OpCode::TEXT);
+    auto* data = it->second->getUserData();
+
+    uWS::OpCode op = uWS::OpCode::TEXT;
+    std::vector<uint8_t> sendBuf;
+
+    // 如果客户端已加密，用二进制帧发送密文
+    if (data->encryptor) {
+        sendBuf = data->encryptor->encrypt(encoded);
+        op = uWS::OpCode::BINARY;
+        encoded = sendBuf;
+    }
+
+    auto sv = std::string_view(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+    auto status = it->second->send(sv, op);
 
     return status == uWS::WebSocket<false, true, PerSocketData>::SendStatus::SUCCESS;
 }

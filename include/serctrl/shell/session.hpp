@@ -73,6 +73,14 @@ public:
     bool write(const std::string& data);
 
     /**
+     * @brief 从 PTY 读取数据
+     * @param buf 缓冲区
+     * @param len 缓冲区大小
+     * @return 读取字节数，-1 表示错误或已关闭
+     */
+    ssize_t readPTY(char* buf, size_t len);
+
+    /**
      * @brief 调整终端大小
      * @param cols 新列数
      * @param rows 新行数

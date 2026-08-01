@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(serctrl
-    VERSION 0.1.0
+    VERSION 0.1.1
     DESCRIPTION "Encrypted remote shell over WebSocket"
     LANGUAGES C CXX
 )

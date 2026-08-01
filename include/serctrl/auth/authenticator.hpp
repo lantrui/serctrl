@@ -112,16 +112,16 @@ public:
      */
     static Token hexToToken(const std::string& hex);
 
-private:
-    void load();        ///< 从文件加载用户数据
-    void save() const;  ///< 保存用户数据到文件
-
-    /**
+/**
      * @brief 计算令牌指纹
      * @param token 令牌
      * @return SHA-256 指纹
      */
     static Fingerprint computeFingerprint(const Token& token);
+
+private:
+    void load();        ///< 从文件加载用户数据
+    void save() const;  ///< 保存用户数据到文件
 
     std::filesystem::path authFile_;                    ///< 认证文件路径
     std::unordered_map<std::string, UserRecord> users_; ///< 用户记录映射表
