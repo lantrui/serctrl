@@ -80,12 +80,26 @@ enum class MsgType : uint8_t {
 struct AuthPayload {
     std::string user;   ///< 用户名
     std::string token;  ///< 认证令牌
+    /**
+     * @brief 客户端握手随机数（64字符十六进制，可选）
+     *
+     * 与服务端随机数一起混入会话密钥派生，使每个连接的会话密钥唯一。
+     * 缺省时服务端仍会混入自己的随机数（旧客户端兼容路径）。
+     */
+    std::string clientNonce;
 };
 
 /** @brief 认证结果载荷 */
 struct AuthResultPayload {
     bool ok;                ///< 是否成功
     std::string error;      ///< 失败原因（仅失败时有值）
+    /**
+     * @brief 服务端握手随机数（64字符十六进制，可选）
+     *
+     * 认证成功时携带；客户端必须将其与自己的随机数一起用于派生会话密钥，
+     * 否则无法解密后续加密流量。
+     */
+    std::string serverNonce;
 };
 
 // ═══════════════════════════════════════════

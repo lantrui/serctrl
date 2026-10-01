@@ -31,8 +31,9 @@ using json = nlohmann::json;
 // ═══════════════════════════════════════════
 // 为每个载荷类型生成 to_json/from_json 函数
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AuthPayload, user, token)
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AuthResultPayload, ok, error)
+// 可选字段：使用默认值初始化，兼容旧对端发来的缺省字段（如握手随机数）
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(AuthPayload, user, token, clientNonce)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(AuthResultPayload, ok, error, serverNonce)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(ShellOpenPayload, requestId, cols, rows)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(ShellOpenResultPayload, requestId, sessionId, ok)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(ShellDataPayload, sessionId, data)

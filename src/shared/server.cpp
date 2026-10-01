@@ -24,11 +24,13 @@
 
 #include <App.h>
 #include <nlohmann/json.hpp>
+#include <sodium.h>
 #include <atomic>
 #include <thread>
 #include <unordered_map>
 #include <mutex>
 #include <memory>
+#include <vector>
 
 namespace serctrl::transport {
 
@@ -86,8 +88,20 @@ void Server::start() {
                 // 连接建立
                 .open = [this, &s](auto* ws) {
                     auto* data = ws->getUserData();
-                    // 分配客户端ID
+
                     std::lock_guard<std::mutex> lock(s.mutex);
+
+                    // 强制执行最大连接数限制，防止资源耗尽（DoS）。
+                    // 历史实现从未检查该限制，攻击者可耗尽服务器资源。
+                    if (s.sockets.size() >= config_.maxConnections) {
+                        LOG_WARN("Max connections (%u) reached, rejecting new client",
+                                 config_.maxConnections);
+                        // uWS 的 end() 仅支持 (code, message)，无 payload 重载。
+                        ws->end(1013, "Too many connections");
+                        return;
+                    }
+
+                    // 分配客户端ID
                     data->clientId = std::to_string(s.nextClientId++);
                     s.sockets[data->clientId] = ws;
                     LOG_INFO("Client %s connected (total: %zu)",
@@ -128,10 +142,20 @@ void Server::start() {
                         msg->type != protocol::MsgType::Ping) {
                         protocol::Message resp;
                         resp.type = protocol::MsgType::AuthResult;
-                        resp.payload = protocol::AuthResultPayload{false, "Authentication required"};
+                        resp.payload = protocol::AuthResultPayload{false, "Authentication required", ""};
                         auto encoded = protocol::encode(resp);
                         ws->send(std::string_view(reinterpret_cast<const char*>(encoded.data()), encoded.size()),
                                  uWS::OpCode::TEXT);
+                        return;
+                    }
+
+                    // 【降级防护】加密通道建立后拒绝一切明文（TEXT）帧：
+                    // 历史实现对已加密连接仍接受明文消息，攻击者（如位于代理处）
+                    // 可诱导或伪造明文帧绕过加密层。此后仅接受 BINARY 密文，
+                    // 心跳保活由 uWS 自动 ping 与已加密的 Ping/Pong 承担。
+                    if (data->encryptor && opCode == uWS::OpCode::TEXT) {
+                        LOG_WARN("Rejected plaintext frame from encrypted client %s (possible downgrade)",
+                                 data->clientId.c_str());
                         return;
                     }
 
@@ -143,18 +167,32 @@ void Server::start() {
                             data->authenticated = ok;
                             data->user = authPayload->user;
 
-                            // 认证成功后派生会话密钥
+                            // 认证成功后派生会话密钥：
+                            // 混入服务端一次性随机数（以及客户端随机数，若提供），
+                            // 使每个连接的会话密钥唯一——取代历史的静态密钥
+                            // （同一令牌的每次连接密钥相同，无法防重放/单会话泄露扩散）。
+                            std::string serverNonceHex;
                             if (ok) {
-                                auth::Fingerprint fp = auth::Authenticator::computeFingerprint(
-                                    auth::Authenticator::hexToToken(authPayload->token));
-                                crypto::Key sessionKey;
-                                std::copy(fp.begin(), fp.end(), sessionKey.begin());
+                                auth::HandshakeNonce serverNonce = auth::Authenticator::generateHandshakeNonce();
+                                serverNonceHex = auth::Authenticator::nonceToHex(serverNonce);
+
+                                std::vector<uint8_t> secret;
+                                secret.reserve(authPayload->token.size() + auth::HANDSHAKE_NONCE_BYTES * 2);
+                                secret.insert(secret.end(), authPayload->token.begin(), authPayload->token.end());
+                                secret.insert(secret.end(), serverNonce.begin(), serverNonce.end());
+                                if (authPayload->clientNonce.size() == auth::HANDSHAKE_NONCE_BYTES * 2) {
+                                    auto cn = auth::Authenticator::hexToNonce(authPayload->clientNonce);
+                                    secret.insert(secret.end(), cn.begin(), cn.end());
+                                }
+                                crypto::Key sessionKey = auth::Authenticator::deriveSessionKey(secret);
+                                sodium_memzero(secret.data(), secret.size());  // 及时清零密钥材料
                                 data->encryptor = std::make_unique<crypto::Encryptor>(sessionKey);
                             }
 
                             protocol::Message resp;
                             resp.type = protocol::MsgType::AuthResult;
-                            resp.payload = protocol::AuthResultPayload{ok, ok ? "" : "Invalid credentials"};
+                            resp.payload = protocol::AuthResultPayload{
+                                ok, ok ? "" : "Invalid credentials", serverNonceHex};
                             auto encoded = protocol::encode(resp);
                             ws->send(std::string_view(reinterpret_cast<const char*>(encoded.data()), encoded.size()),
                                      uWS::OpCode::TEXT);
@@ -274,8 +312,9 @@ void Server::disconnectClient(const std::string& clientId) {
 
     auto it = s.sockets.find(clientId);
     if (it != s.sockets.end()) {
-        it->second->close();
-        s.sockets.erase(it);
+        // 用 end() 发送正常的 WebSocket Close 帧（close() 是裸 TCP 关闭，
+        // 会让对端看到协议错误而非干净断开）；close 回调负责从映射表移除。
+        it->second->end(1000, "");
     }
 }
 

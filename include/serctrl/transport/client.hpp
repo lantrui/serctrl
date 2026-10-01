@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "serctrl/protocol/message.hpp"
 #include "serctrl/transport/connection.hpp"
@@ -91,14 +92,30 @@ public:
      * @param user 用户名
      * @param token 认证令牌
      * @return 是否成功发送
+     *
+     * 自动生成一次性客户端握手随机数并随认证请求发送，
+     * 该随机数与服务端返回的 serverNonce 一起派生本连接的会话密钥。
      */
     bool authenticate(const std::string& user, const std::string& token);
 
     /**
-     * @brief 启用加密
-     * @param token 认证令牌（用于派生会话密钥）
+     * @brief 处理服务端返回的认证结果（含握手随机数）
+     * @param result AuthResult 载荷
      *
-     * 认证成功后调用，从 token 派生 Encryptor 密钥。
+     * 成功时从（令牌 || 服务端随机数 || 客户端随机数）派生一次性会话密钥，
+     * 与服务端使用完全相同的派生公式；随后把后续消息切换为加密二进制帧。
+     * 失败或缺少 serverNonce 时保持明文通道并上报错误。
+     */
+    void handleAuthResult(const protocol::AuthResultPayload& result);
+
+    /**
+     * @brief 启用加密（兼容旧接口）
+     * @param token 认证令牌
+     *
+     * @deprecated 历史实现直接用令牌指纹作为静态会话密钥（同一令牌的每次
+     * 连接密钥相同，无法防重放）。新代码应改用 handleAuthResult()，其内部
+     * 通过双方握手随机数派生每连接唯一的会话密钥。此方法仅保留给尚未感知
+     * 握手协议的旧调用方。
      */
     void enableEncryption(const std::string& token);
 
@@ -119,6 +136,9 @@ private:
     bool connected_ = false;            ///< 连接状态
     std::function<void()> onConnect_;   ///< 连接成功回调
     std::function<void()> onDisconnect_; ///< 断开连接回调
+
+    /** @brief 本连接的客户端握手随机数（64字符hex，认证时生成，参与会话密钥派生） */
+    std::string clientNonceHex_;
 
     struct ClientState;
     std::unique_ptr<ClientState> state_; ///< 内部状态（PIMPL）
