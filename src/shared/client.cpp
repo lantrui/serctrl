@@ -24,8 +24,11 @@
 #include "serctrl/util/logger.hpp"
 
 #include <ixwebsocket/IXWebSocket.h>
+#include <sodium.h>
+#include <algorithm>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 namespace serctrl::transport {
 
@@ -77,7 +80,6 @@ bool Client::connect(const ClientConfig& config) {
                     reinterpret_cast<const uint8_t*>(msg->str.data()), msg->str.size());
 
                 // 加密消息：先解密再解码
-                auto* binMsg = dynamic_cast<const ix::WebSocketMessage*>(msg.get());
                 if (encryptor_ && msg->binary) {
                     try {
                         auto plaintext = encryptor_->decrypt(raw);
@@ -85,6 +87,9 @@ bool Client::connect(const ClientConfig& config) {
                     } catch (...) {
                         LOG_ERROR("Decryption failed");
                     }
+                } else if (encryptor_ && !msg->binary) {
+                    // 【降级防护】加密通道建立后拒绝明文帧（与服务端策略对称）
+                    LOG_WARN("Rejected plaintext frame on encrypted channel (possible downgrade)");
                 } else {
                     handleMessage(raw);
                 }
@@ -174,24 +179,61 @@ void Client::close() {
 }
 
 bool Client::authenticate(const std::string& user, const std::string& token) {
+    // 每次连接（含自动重连）生成全新的一次性握手随机数，
+    // 保证派生出的会话密钥每连接唯一。
+    clientNonceHex_ = auth::Authenticator::nonceToHex(
+        auth::Authenticator::generateHandshakeNonce());
+
     protocol::Message msg;
     msg.type = protocol::MsgType::Auth;
     msg.id = 1;
     msg.ts = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    msg.payload = protocol::AuthPayload{user, token};
+    msg.payload = protocol::AuthPayload{user, token, clientNonceHex_};
 
     return send(msg);
 }
 
+void Client::handleAuthResult(const protocol::AuthResultPayload& result) {
+    if (!result.ok) {
+        handleError(result.error.empty() ? "Authentication failed" : result.error);
+        return;
+    }
+    if (result.serverNonce.size() != auth::HANDSHAKE_NONCE_BYTES * 2) {
+        // 服务端未提供握手随机数：不能与服务端一致地派生会话密钥。
+        // 绝不回退到旧的静态密钥（可被重放），保持明文并显式报错。
+        encryptor_.reset();
+        LOG_ERROR("Auth ok but serverNonce missing/invalid; encryption unavailable");
+        handleError("Server did not provide handshake nonce; encrypted channel unavailable");
+        return;
+    }
+
+    // 与服务端完全一致的派生公式：token || serverNonce || clientNonce
+    std::vector<uint8_t> secret;
+    secret.reserve(config_.token.size() + auth::HANDSHAKE_NONCE_BYTES * 2);
+    secret.insert(secret.end(), config_.token.begin(), config_.token.end());
+    auto sn = auth::Authenticator::hexToNonce(result.serverNonce);
+    secret.insert(secret.end(), sn.begin(), sn.end());
+    if (clientNonceHex_.size() == auth::HANDSHAKE_NONCE_BYTES * 2) {
+        auto cn = auth::Authenticator::hexToNonce(clientNonceHex_);
+        secret.insert(secret.end(), cn.begin(), cn.end());
+    }
+    crypto::Key sessionKey = auth::Authenticator::deriveSessionKey(secret);
+    sodium_memzero(secret.data(), secret.size());  // 及时清零密钥材料
+    encryptor_ = std::make_unique<crypto::Encryptor>(sessionKey);
+    LOG_INFO("Encryption enabled (per-session key derived from handshake nonces)");
+}
+
 void Client::enableEncryption(const std::string& token) {
-    // 用令牌指纹派生32字节会话密钥
+    // 【兼容旧协议】用令牌指纹派生静态会话密钥。
+    // 该方式同一令牌的每次连接密钥相同，存在重放风险；仅当对端为
+    // 不理解握手随机数的旧版服务端时使用。新代码请调用 handleAuthResult()。
     auto fp = auth::Authenticator::computeFingerprint(
         auth::Authenticator::hexToToken(token));
     serctrl::crypto::Key sessionKey;
     std::copy(fp.begin(), fp.end(), sessionKey.begin());
     encryptor_ = std::make_unique<serctrl::crypto::Encryptor>(sessionKey);
-    LOG_INFO("Encryption enabled");
+    LOG_WARN("Encryption enabled with LEGACY static key (no forward isolation)");
 }
 
 void Client::onConnect(std::function<void()> handler) {

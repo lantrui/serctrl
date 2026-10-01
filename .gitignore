@@ -1,31 +1,11 @@
-# Build
+# Build artifacts
 build/
-cmake-build-*/
-.cache/
-compile_commands.json
 
-# Compiled
+# Compiled object files and binaries
 *.o
+*.obj
 *.a
+*.exe
+*.dll
 *.so
-*.dylib
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Dependencies (fetched by CMake)
-_deps/
-
-# Test artifacts
-Testing/
-
-# Encrypted config (sensitive)
-*.enc
+*.out

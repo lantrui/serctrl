@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "serctrl/crypto/encryptor.hpp"
